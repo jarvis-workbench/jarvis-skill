@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import sqlite3
+import sys
+from pathlib import Path
+
+
+UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def debug(enabled, message):
+    if enabled:
+        print(f"debug: {message}", file=sys.stderr)
+
+
+def is_uuid_like(value):
+    return bool(value and UUID_RE.match(value))
+
+
+def connect_readonly(path):
+    if not path.exists():
+        return None
+    uri = f"file:{path}?mode=ro"
+    return sqlite3.connect(uri, uri=True)
+
+
+def query_one(conn, sql, params=()):
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(sql, params).fetchone()
+    except sqlite3.Error:
+        return None
+    return row
+
+
+def thread_id_from_env():
+    value = os.environ.get("CODEX_THREAD_ID", "")
+    return value if is_uuid_like(value) else None
+
+
+def thread_id_from_logs(conn, cwd):
+    row = query_one(
+        conn,
+        """
+        SELECT thread_id
+        FROM logs
+        WHERE thread_id IS NOT NULL
+          AND thread_id != ''
+          AND feedback_log_body LIKE '%' || 'cwd=' || ? || '%'
+        ORDER BY ts DESC, ts_nanos DESC, id DESC
+        LIMIT 1
+        """,
+        (cwd,),
+    )
+    if row and is_uuid_like(row[0]):
+        return row[0]
+    return None
+
+
+def thread_id_from_state(conn, cwd):
+    row = query_one(
+        conn,
+        """
+        SELECT id
+        FROM threads
+        WHERE cwd = ?
+          AND archived = 0
+        ORDER BY updated_at_ms DESC, updated_at DESC
+        LIMIT 1
+        """,
+        (cwd,),
+    )
+    if row and is_uuid_like(row[0]):
+        return row[0]
+    return None
+
+
+def get_thread(conn, thread_id):
+    row = query_one(
+        conn,
+        """
+        SELECT id, title, cwd, source, thread_source, first_user_message, preview
+        FROM threads
+        WHERE id = ?
+        LIMIT 1
+        """,
+        (thread_id,),
+    )
+    if not row:
+        return None
+    keys = [
+        "thread_id",
+        "thread_title",
+        "cwd",
+        "source",
+        "thread_source",
+        "first_user_message",
+        "preview",
+    ]
+    return dict(zip(keys, row))
+
+
+def load_global_state(codex_home):
+    path = codex_home / ".codex-global-state.json"
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def project_name(project_id):
+    if project_id == "对话":
+        return "对话"
+    return Path(project_id).name or project_id
+
+
+def longest_matching_project(cwd, roots):
+    cwd_path = Path(cwd).resolve()
+    matches = []
+    for root in roots:
+        try:
+            root_path = Path(root).resolve()
+        except OSError:
+            root_path = Path(root)
+        try:
+            cwd_path.relative_to(root_path)
+        except ValueError:
+            continue
+        matches.append(str(root_path))
+    if not matches:
+        return None
+    return max(matches, key=len)
+
+
+def resolve_project(thread_id, cwd, global_state):
+    projectless_ids = set(global_state.get("projectless-thread-ids") or [])
+    if thread_id in projectless_ids:
+        return "对话", "对话", True
+
+    hint = (global_state.get("thread-workspace-root-hints") or {}).get(thread_id)
+    roots = []
+    for key in ("project-order", "electron-saved-workspace-roots"):
+        value = global_state.get(key)
+        if isinstance(value, list):
+            roots.extend(v for v in value if isinstance(v, str))
+
+    project_id = None
+    if hint and hint in roots:
+        project_id = hint
+    elif cwd:
+        project_id = longest_matching_project(cwd, roots)
+    elif hint:
+        project_id = hint
+
+    if not project_id:
+        return "对话", "对话", True
+
+    return project_name(project_id), project_id, False
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Print the current Codex conversation and sidebar project metadata."
+    )
+    parser.add_argument("--id-only", action="store_true", help="print only the conversation id")
+    parser.add_argument("--pretty", action="store_true", help="pretty-print JSON output")
+    parser.add_argument("--debug", action="store_true", help="print lookup steps to stderr")
+    args = parser.parse_args()
+
+    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
+    cwd = os.environ.get("PWD") or os.getcwd()
+    logs_db = codex_home / "logs_2.sqlite"
+    state_db = codex_home / "state_5.sqlite"
+
+    logs_conn = connect_readonly(logs_db)
+    state_conn = connect_readonly(state_db)
+
+    source = ""
+    thread_id = thread_id_from_env()
+    if thread_id:
+        source = "env:CODEX_THREAD_ID"
+        debug(args.debug, f"using {source}")
+
+    if not thread_id:
+        debug(args.debug, f"checking {logs_db} for cwd={cwd}")
+        thread_id = thread_id_from_logs(logs_conn, cwd)
+        if thread_id:
+            source = "sqlite:logs_2.sqlite"
+
+    if not thread_id:
+        debug(args.debug, f"checking {state_db} for cwd={cwd}")
+        thread_id = thread_id_from_state(state_conn, cwd)
+        if thread_id:
+            source = "sqlite:state_5.sqlite"
+
+    if not thread_id:
+        print("Could not determine the current Codex thread id.", file=sys.stderr)
+        print("Tip: run this from inside a Codex agent shell.", file=sys.stderr)
+        return 1
+
+    if args.id_only:
+        print(thread_id)
+        return 0
+
+    thread = get_thread(state_conn, thread_id) or {
+        "thread_id": thread_id,
+        "thread_title": "",
+        "cwd": cwd,
+        "source": "",
+        "thread_source": "",
+        "first_user_message": "",
+        "preview": "",
+    }
+    title = thread.get("thread_title") or thread.get("preview") or thread.get("first_user_message") or ""
+
+    global_state = load_global_state(codex_home)
+    project, project_id, is_conversation_bucket = resolve_project(
+        thread_id, thread.get("cwd") or cwd, global_state
+    )
+
+    result = {
+        "thread_id": thread_id,
+        "thread_title": title,
+        "project": project,
+        "project_id": project_id,
+        "is_conversation_bucket": is_conversation_bucket,
+        "cwd": thread.get("cwd") or cwd,
+        "source": source,
+    }
+
+    print(json.dumps(result, ensure_ascii=False, indent=2 if args.pretty else None))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

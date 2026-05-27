@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+import argparse
+from datetime import datetime, timezone
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+
+def connect_readonly(path):
+    if not path.exists():
+        return None
+    return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+
+
+def query_one(conn, sql, params=()):
+    if conn is None:
+        return None
+    try:
+        return conn.execute(sql, params).fetchone()
+    except sqlite3.Error:
+        return None
+
+
+def load_thread_id(script_path):
+    proc = subprocess.run(
+        [str(script_path), "--pretty"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or "failed to resolve Codex thread id")
+    return json.loads(proc.stdout)
+
+
+def load_jsonl(path):
+    if not path or not Path(path).exists():
+        return []
+    events = []
+    with Path(path).open("r", encoding="utf-8") as fh:
+        for line_no, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            event["_line_no"] = line_no
+            events.append(event)
+    return events
+
+
+def compact_event(event):
+    if event.get("type") == "compacted":
+        return True
+    payload = event.get("payload") or {}
+    return event.get("type") == "event_msg" and payload.get("type") == "context_compacted"
+
+
+def token_count(event):
+    payload = event.get("payload") or {}
+    if event.get("type") != "event_msg" or payload.get("type") != "token_count":
+        return None
+    info = payload.get("info") or {}
+    total = info.get("total_token_usage") or {}
+    last = info.get("last_token_usage") or {}
+    return {
+        "timestamp": event.get("timestamp"),
+        "line_no": event.get("_line_no"),
+        "total_tokens": total.get("total_tokens"),
+        "input_tokens": total.get("input_tokens"),
+        "cached_input_tokens": total.get("cached_input_tokens"),
+        "output_tokens": total.get("output_tokens"),
+        "reasoning_output_tokens": total.get("reasoning_output_tokens"),
+        "last_total_tokens": last.get("total_tokens"),
+        "model_context_window": info.get("model_context_window"),
+    }
+
+
+def parse_timestamp(value):
+    if not value:
+        return None
+    try:
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def minutes_between(start_value, end_value):
+    start = parse_timestamp(start_value)
+    end = parse_timestamp(end_value)
+    if not start or not end:
+        return None
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    return max(0, (end - start).total_seconds() / 60)
+
+
+def event_summary(event):
+    return {
+        "timestamp": event.get("timestamp"),
+        "line_no": event.get("_line_no"),
+        "type": event.get("type"),
+        "payload_type": (event.get("payload") or {}).get("type"),
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Inspect the current Codex thread for token usage and context compaction markers."
+    )
+    parser.add_argument("--pretty", action="store_true", help="pretty-print JSON output")
+    parser.add_argument(
+        "--recent-minutes",
+        type=float,
+        default=5.0,
+        help="time window used to classify a compaction as just happened",
+    )
+    parser.add_argument(
+        "--recent-turns",
+        type=int,
+        default=1,
+        help="maximum number of turn_context events after compaction for just-resumed detection",
+    )
+    args = parser.parse_args()
+
+    skill_dir = Path(__file__).resolve().parents[1]
+    thread_script = skill_dir / "scripts" / "get-codex-thread-id"
+    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
+    state_db = codex_home / "state_5.sqlite"
+
+    thread_meta = load_thread_id(thread_script)
+    thread_id = thread_meta["thread_id"]
+    conn = connect_readonly(state_db)
+    row = query_one(
+        conn,
+        """
+        SELECT title, cwd, tokens_used, updated_at_ms, model, reasoning_effort, rollout_path
+        FROM threads
+        WHERE id = ?
+        LIMIT 1
+        """,
+        (thread_id,),
+    )
+
+    thread_state = {}
+    rollout_path = None
+    if row:
+        keys = [
+            "title",
+            "cwd",
+            "tokens_used",
+            "updated_at_ms",
+            "model",
+            "reasoning_effort",
+            "rollout_path",
+        ]
+        thread_state = dict(zip(keys, row))
+        rollout_path = thread_state.get("rollout_path")
+
+    events = load_jsonl(rollout_path)
+    compact_events = [
+        event_summary(event)
+        for event in events
+        if compact_event(event)
+    ]
+    token_events = [value for event in events if (value := token_count(event))]
+    latest_token = token_events[-1] if token_events else None
+    latest_compaction = compact_events[-1] if compact_events else None
+    latest_event = event_summary(events[-1]) if events else None
+
+    events_after_latest_compaction = []
+    if latest_compaction:
+        latest_line_no = latest_compaction["line_no"]
+        events_after_latest_compaction = [
+            event for event in events if event.get("_line_no", 0) > latest_line_no
+        ]
+
+    turns_after_compaction = sum(
+        1 for event in events_after_latest_compaction if event.get("type") == "turn_context"
+    )
+    user_messages_after_compaction = sum(
+        1
+        for event in events_after_latest_compaction
+        if event.get("type") == "event_msg"
+        and (event.get("payload") or {}).get("type") == "user_message"
+    )
+    agent_messages_after_compaction = sum(
+        1
+        for event in events_after_latest_compaction
+        if event.get("type") == "event_msg"
+        and (event.get("payload") or {}).get("type") == "agent_message"
+    )
+    minutes_since_compaction = (
+        minutes_between(latest_compaction["timestamp"], latest_event["timestamp"])
+        if latest_compaction and latest_event
+        else None
+    )
+    recently_observed = bool(
+        latest_compaction
+        and minutes_since_compaction is not None
+        and minutes_since_compaction <= args.recent_minutes
+        and turns_after_compaction <= args.recent_turns
+    )
+
+    result = {
+        "thread": thread_meta,
+        "state": thread_state,
+        "rollout_path": rollout_path,
+        "context_compaction": {
+            "ever_observed": bool(compact_events),
+            "recently_observed": recently_observed,
+            "latest_event": latest_compaction,
+            "latest_rollout_event": latest_event,
+            "event_count": len(compact_events),
+            "minutes_since_latest_event": minutes_since_compaction,
+            "turn_contexts_after_latest_event": turns_after_compaction,
+            "user_messages_after_latest_event": user_messages_after_compaction,
+            "agent_messages_after_latest_event": agent_messages_after_compaction,
+            "recent_threshold": {
+                "minutes": args.recent_minutes,
+                "turn_contexts": args.recent_turns,
+            },
+            "requires_secretary_recovery": recently_observed,
+            "agent_action": (
+                "if requires_secretary_recovery is true, check for a live secretary subagent "
+                "and request its latest complete state before continuing; if only ever_observed "
+                "is true, treat compaction as historical evidence, not as a just-resumed state"
+            ),
+        },
+        "token_usage": {
+            "state_tokens_used": thread_state.get("tokens_used"),
+            "latest_rollout_token_count": latest_token,
+            "note": "tokens_used and total_tokens are cumulative thread usage, not the live context size",
+        },
+    }
+
+    print(json.dumps(result, ensure_ascii=False, indent=2 if args.pretty else None))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
