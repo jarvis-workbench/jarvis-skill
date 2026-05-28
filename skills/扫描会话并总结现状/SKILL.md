@@ -60,6 +60,7 @@ rg -n "spawn_agent|send_input|close_agent|subagent_notification|task_complete|fi
 ## 总结格式
 
 最终回答要面向接手者，直接给最新状态，不写扫描过程流水账。
+不要做压缩、失真总结，必须做完整最新状态内容的总结
 
 必须包含：
 
