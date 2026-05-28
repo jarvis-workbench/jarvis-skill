@@ -44,10 +44,12 @@
 
 ## 上下文压缩恢复闭环
 
+先把当前 `SKILL.md` 所在目录记为 `SKILL_DIR`。本 skill 自带脚本、资料和后续相对路径，都必须从 `SKILL_DIR` 解析，不允许从项目根目录或某个固定 `.jarvis` 目录解析。
+
 使用本 skill 接手任务时，必须先判断当前线程是否刚经历上下文压缩，再继续调度。优先执行：
 
 ```bash
-.jarvis/skills/产品经理/scripts/check-codex-context-state --pretty
+"$SKILL_DIR/scripts/check-codex-context-state" --pretty
 ```
 
 该脚本会调用同目录下的 `scripts/get-codex-thread-id` 定位当前 Codex 线程，并读取本地 Codex 状态与 rollout 记录，检查当前线程 ID、标题、项目、cwd、`threads.tokens_used`、最新 rollout `token_count`、历史 `compacted` / `context_compacted` 事件，以及最近一次压缩事件是否仍处于刚刚接手范围。
@@ -64,6 +66,7 @@
 1. 有存活秘书子 agent：向其索要“当前任务最新完整状态”，并以该内容恢复调度状态；不得使用内部自动传递的压缩交接摘要作为后续工作内容，必须以秘书子 agent 提供的内容为准。
 2. 没有存活秘书子 agent：先判断秘书子 agent 能否恢复；可以恢复则按上一条执行；无法恢复时，必须根据当前 Codex 线程 ID，从后往前读取本轮压缩前到上一轮压缩后的实际完整对话记录内容，再继续规划、派工、核查或收尾。
 
+已确认刚刚经历压缩后，必须重新读 `SKILL.md`中的完整内容。
 已确认刚刚经历压缩后，不允许跳过秘书恢复直接派工。任何时候都不允许直接使用内部自动传递的压缩交接摘要进行后续工作。
 
 注意：`tokens_used` 和 rollout 的 `total_tokens` 是线程累计 token 消耗，不等同于当前上下文实际占用。判断是否发生过压缩，应以 `compacted`、`context_compacted` 或可见压缩交接摘要为准；判断是否刚刚经历压缩，应以 `requires_secretary_recovery` 或新的压缩交接摘要为准。
@@ -129,6 +132,7 @@
 
 工作子 agent 规则：
 
+- 不相互存在影响的工作，可以使用多个工作子 agent 同时开工
 - 任务较重时，只要子 agent 没有异常且仍在正常推进，不允许因为觉得慢而直接关闭。
 - 达到 30 分钟无回报阈值时，不要一味等待，也不要要求它继续工作后再回报状态；应打断该 agent 并做 `简单心跳确认`。
 - 运行中的 `简单心跳确认` 失败后，才能判定该子 agent 异常；此时按 `子 agent 管理` 关闭该子 agent，并让新的工作子 agent 接手。

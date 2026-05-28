@@ -12,16 +12,18 @@
 
 ## 推荐脚本
 
+先把当前 `SKILL.md` 所在目录记为 `SKILL_DIR`。本 skill 自带脚本、资料和后续相对路径，都必须从 `SKILL_DIR` 解析，不允许从项目根目录或某个固定 `.jarvis` 目录解析。
+
 优先使用本 skill 自带脚本做机械提取：
 
 ```bash
-node .jarvis/skills/扫描会话并总结现状/scripts/extract-session-state.mjs <会话id> --markdown
+node "$SKILL_DIR/scripts/extract-session-state.mjs" <会话id> --markdown
 ```
 
 需要给其他工具消费时使用 JSON：
 
 ```bash
-node .jarvis/skills/扫描会话并总结现状/scripts/extract-session-state.mjs <会话id> --json
+node "$SKILL_DIR/scripts/extract-session-state.mjs" <会话id> --json
 ```
 
 脚本只读取 Codex 会话 JSONL，默认搜索：

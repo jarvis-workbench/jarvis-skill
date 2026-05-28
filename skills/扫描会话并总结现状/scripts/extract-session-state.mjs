@@ -8,7 +8,7 @@ const argv = process.argv.slice(2);
 function usage(exitCode = 1) {
   const text = [
     'Usage:',
-    '  node .jarvis/skills/扫描会话并总结现状/scripts/extract-session-state.mjs <session-id> [--markdown|--json]',
+    '  node "$SKILL_DIR/scripts/extract-session-state.mjs" <session-id> [--markdown|--json]',
     '',
     'Options:',
     '  --codex-home <path>        Codex data root. Default: ~/.codex',
